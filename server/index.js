@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
 
 const examlyRoutes = require('./routes/examly');
 const groqRoutes   = require('./routes/groq');
@@ -8,6 +10,14 @@ const executeRoutes = require('./routes/execute');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
+
+// In production (deployed), the client is pre-built to static files and
+// served from this SAME process/origin — no separate Vite server, no CORS
+// needed for the frontend<->API calls since they're same-origin. Locally in
+// dev, Vite's own dev server handles the frontend on :5173 and proxies /api
+// calls here instead, so this block only activates when a build exists.
+const clientDist = path.join(__dirname, '..', 'client', 'dist');
+const hasClientBuild = fs.existsSync(path.join(clientDist, 'index.html'));
 
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors({
@@ -25,6 +35,16 @@ app.use('/api/execute', executeRoutes);
 app.get('/health', (_req, res) =>
   res.json({ status: 'ok', time: new Date().toISOString() })
 );
+
+// ── Serve the built frontend (production only) ─────────────────────────────
+if (hasClientBuild) {
+  app.use(express.static(clientDist));
+  // SPA fallback: any non-API, non-file route serves index.html so the
+  // client's own React state (not a URL router) takes over from there.
+  app.get(/^(?!\/api\/|\/health).*/, (_req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
 
 // ── Catch-all error handler ─────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {

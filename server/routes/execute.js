@@ -27,14 +27,20 @@ const COMPILE_TIMEOUT_MS = 20000; // compiling (esp. C++ headers like <bits/stdc
 // Fixed by prepending their known install directories directly to the
 // PATH used for every spawned child process here, independent of whatever
 // the parent Node process's own (stale) PATH is.
-var EXTRA_PATH_DIRS = [
+// Windows-only (this developer machine's specific install locations) — on
+// Linux (e.g. the Docker image used for deployment), gcc/g++/python3/javac
+// come from apt packages already on the system PATH, so none of this
+// applies there; EXTRA_PATH_DIRS stays empty and childEnv() is a no-op.
+var EXTRA_PATH_DIRS = process.platform === 'win32' ? [
   'C:\\Users\\PradeepS\\AppData\\Local\\Programs\\Python\\Python312',
   'C:\\Users\\PradeepS\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\\mingw64\\bin',
   'C:\\Users\\PradeepS\\jdk21\\jdk-21.0.12.1+1\\bin' // portable ZIP extract — MSI installs all needed admin elevation we can't grant non-interactively
-];
+] : [];
 
 function childEnv() {
-  return Object.assign({}, process.env, { PATH: EXTRA_PATH_DIRS.join(';') + ';' + (process.env.PATH || '') });
+  if (!EXTRA_PATH_DIRS.length) return process.env;
+  var sep = process.platform === 'win32' ? ';' : ':';
+  return Object.assign({}, process.env, { PATH: EXTRA_PATH_DIRS.join(sep) + sep + (process.env.PATH || '') });
 }
 
 function runProcess(cmd, args, input, cwd, timeoutMs) {
@@ -84,7 +90,12 @@ function prepare(language, code, dir) {
   if (lang.indexOf('python') !== -1) {
     var pyFile = path.join(dir, 'main.py');
     fs.writeFileSync(pyFile, code, 'utf8');
-    return Promise.resolve({ run: function(input) { return runProcess('python', [pyFile], input, dir); } });
+    // Linux images typically only have `python3` on PATH, not `python`
+    // (which may not exist at all, or still mean Python 2 on very old
+    // systems) — Windows dev machines have `python`. Docker install also
+    // symlinks python->python3 as a belt-and-suspenders backup.
+    var pyCmd = process.platform === 'win32' ? 'python' : 'python3';
+    return Promise.resolve({ run: function(input) { return runProcess(pyCmd, [pyFile], input, dir); } });
   }
 
   // Match "c", "c (17)", "c(17)", etc. but NOT "c++" — versioned variants
