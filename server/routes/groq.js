@@ -5,7 +5,12 @@ const axios = require('axios');
 const router = express.Router();
 const GROQ_BASE = 'https://api.groq.com/openai/v1';
 const MODEL = 'openai/gpt-oss-120b';
-const MAX_RETRIES = 3;
+// CONFIRMED live: with 4 Groq calls per question (solution + header + footer
+// + codeStub) across several questions in a row, 429s happen regularly
+// enough that 3 retries with a max ~8s backoff wasn't always enough to
+// outlast a sustained rate-limit window. Matches REQ_RETRY_DEFAULT_TRIES
+// used for the Examly-side calls elsewhere in this app.
+const MAX_RETRIES = 5;
 
 function safeJSON(text) {
   try {

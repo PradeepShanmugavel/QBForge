@@ -363,22 +363,26 @@ export default function Step6AddSolutions() {
         });
         if (!solRes.ok) throw new Error(solRes.error || 'Translation failed');
 
-        const [headerRes, footerRes, stubRes] = await Promise.all([
-          best.header
-            ? translateFragment({ code: best.header, fromLanguage, toLanguage: targetLanguage, kind: 'header' })
-            : Promise.resolve({ ok: true, code: '' }),
-          best.footer
-            ? translateFragment({ code: best.footer, fromLanguage, toLanguage: targetLanguage, kind: 'footer' })
-            : Promise.resolve({ ok: true, code: '' }),
-          best.codeStub
-            ? translateStub({
-                codeStub: best.codeStub, originalSolution: best.code || '', translatedSolution: solRes.code,
-                fromLanguage, toLanguage: targetLanguage, question_text: q.title
-              })
-            : Promise.resolve({ ok: true, code: '' })
-        ]);
+        // Sequential, not Promise.all — CONFIRMED live that 4 Groq calls per
+        // question (solution + these 3) bursting at once trips Groq's rate
+        // limit (429s), especially across several questions in a row. A bit
+        // slower per question, but far fewer rate-limit failures overall.
+        const headerRes = best.header
+          ? await translateFragment({ code: best.header, fromLanguage, toLanguage: targetLanguage, kind: 'header' })
+          : { ok: true, code: '' };
         if (!headerRes.ok) throw new Error(headerRes.error || 'Header translation failed');
+
+        const footerRes = best.footer
+          ? await translateFragment({ code: best.footer, fromLanguage, toLanguage: targetLanguage, kind: 'footer' })
+          : { ok: true, code: '' };
         if (!footerRes.ok) throw new Error(footerRes.error || 'Footer translation failed');
+
+        const stubRes = best.codeStub
+          ? await translateStub({
+              codeStub: best.codeStub, originalSolution: best.code || '', translatedSolution: solRes.code,
+              fromLanguage, toLanguage: targetLanguage, question_text: q.title
+            })
+          : { ok: true, code: '' };
         if (!stubRes.ok) throw new Error(stubRes.error || 'Code stub translation failed');
 
         // hasSnippet is carried over from the SOURCE as-is (it's an

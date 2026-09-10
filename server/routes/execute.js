@@ -15,10 +15,22 @@ const path = require('path');
 const router = express.Router();
 
 const RUN_TIMEOUT_MS = 5000;      // per test case — catches infinite loops in the candidate's logic
+const JAVA_RUN_TIMEOUT_MS = 10000; // JVM startup itself eats a meaningful chunk of a 5s budget even on
+                                   // a normal machine — CONFIRMED live: on a CPU-constrained host (e.g. a
+                                   // free-tier cloud instance with a fraction of a core), several
+                                   // otherwise-correct Java programs timed out purely on cold JVM start,
+                                   // not because the logic was slow. Other languages don't pay this cost.
 const COMPILE_TIMEOUT_MS = 20000; // compiling (esp. C++ headers like <bits/stdc++.h> or heavy STL includes,
                                    // cold-cache first run) legitimately takes longer than a run-time infinite
                                    // loop should ever be allowed — confirmed live: g++ alone hit the old 5s
                                    // run-timeout on a completely valid, non-hanging program.
+// Running every test case for a question fully concurrently (no cap) is
+// fine on a real machine, but CONFIRMED live to overwhelm a CPU-constrained
+// host: N simultaneous JVMs (or compiled binaries) fighting over a fraction
+// of a core made every one of them slower, cascading into timeouts across
+// otherwise-correct code. Capped instead of removed entirely — still gets
+// real concurrency benefit, just bounded.
+const MAX_CONCURRENT_RUNS = 3;
 
 // The already-running dev server process captured its PATH at launch, long
 // before today's toolchain installs — a nodemon restart re-execs node but
@@ -131,11 +143,26 @@ function prepare(language, code, dir) {
     fs.writeFileSync(javaFile, code, 'utf8');
     return runProcess('javac', [javaFile], null, dir, COMPILE_TIMEOUT_MS).then(function(r) {
       if (!r.ok) return { compileError: r.error };
-      return { run: function(input) { return runProcess('java', ['-cp', dir, 'Main'], input, dir); } };
+      return { run: function(input) { return runProcess('java', ['-cp', dir, 'Main'], input, dir, JAVA_RUN_TIMEOUT_MS); } };
     });
   }
 
   return Promise.resolve({ compileError: 'Unsupported language for local execution: ' + language });
+}
+
+// Runs `fn` over `items` with at most `limit` in flight at once (order of
+// results matches `items`, same shape as Promise.all). See MAX_CONCURRENT_RUNS.
+function mapWithConcurrency(items, limit, fn) {
+  var results = new Array(items.length);
+  var idx = 0;
+  function next() {
+    if (idx >= items.length) return Promise.resolve();
+    var i = idx++;
+    return fn(items[i], i).then(function(r) { results[i] = r; return next(); });
+  }
+  var workers = [];
+  for (var w = 0; w < Math.min(limit, items.length); w++) workers.push(next());
+  return Promise.all(workers).then(function() { return results; });
 }
 
 // Judge-standard comparison: trim trailing whitespace on each line and
@@ -175,10 +202,11 @@ router.post('/run-tests', function(req, res) {
     console.log('[EXECUTE] compile OK (or not needed) lang=' + language);
 
     // Test cases are independent (each spawns its own child process, no
-    // shared mutable state) — running them concurrently instead of one at a
-    // time cuts wall-clock time substantially, especially for Java where
-    // every single run pays a fresh JVM startup cost.
-    var runs = testcases.map(function(tc, i) {
+    // shared mutable state), but capped at MAX_CONCURRENT_RUNS rather than
+    // fully unbounded — CONFIRMED live that firing every test case at once
+    // overwhelms a CPU-constrained host (many JVMs/binaries fighting over a
+    // fraction of a core made every single one slower, not just the extras).
+    mapWithConcurrency(testcases, MAX_CONCURRENT_RUNS, function(tc, i) {
       return prep.run(tc.input != null ? String(tc.input) : '').then(function(r) {
         if (!r.ok) {
           console.log('[EXECUTE] test #' + i + ' RUN ERROR: ' + r.error);
@@ -194,9 +222,7 @@ router.post('/run-tests', function(req, res) {
           expected: tc.output, actual: r.stdout, stderr: r.stderr || undefined
         };
       });
-    });
-
-    Promise.all(runs).then(function(results) {
+    }).then(function(results) {
       cleanup();
       var passedCount = results.filter(function(r) { return r.passed; }).length;
       console.log('[EXECUTE] done lang=' + language + ' ' + passedCount + '/' + results.length + ' passed');
