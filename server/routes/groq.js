@@ -233,6 +233,17 @@ router.post('/translate-solution', function(req, res) {
       .replace(/^```[a-zA-Z]*\n?/, '')
       .replace(/```$/, '')
       .trim();
+    // CONFIRMED live: a translation between two very similar languages
+    // (e.g. Java -> Java17) can come back empty after stripping fences —
+    // the model apparently treats a near-identical target as needing no
+    // real output. Silently returning ok:true with empty code cascaded
+    // into a confusing downstream error (an empty solution "compiled" as
+    // just header+footer with no class body, failed, then the auto-fix
+    // call itself got rejected with "code is required" since there was no
+    // code to fix). Treat empty output as a real failure instead.
+    if (!code) {
+      return res.status(500).json({ error: 'Groq returned an empty translation — try Generate again.' });
+    }
     res.json({ ok: true, code: code, model: MODEL });
   });
 });
@@ -287,6 +298,12 @@ router.post('/translate-fragment', function(req, res) {
       .replace(/^```[a-zA-Z]*\n?/, '')
       .replace(/```$/, '')
       .trim();
+    // Only called with a genuinely non-empty source header/footer, so an
+    // empty result here is always a translation failure, not a legitimate
+    // "nothing to translate" case — same reasoning as /translate-solution.
+    if (!out) {
+      return res.status(500).json({ error: 'Groq returned an empty ' + kind + ' translation — try Generate again.' });
+    }
     res.json({ ok: true, code: out, model: MODEL });
   });
 });
@@ -346,6 +363,9 @@ router.post('/translate-stub', function(req, res) {
       .replace(/^```[a-zA-Z]*\n?/, '')
       .replace(/```$/, '')
       .trim();
+    if (!out) {
+      return res.status(500).json({ error: 'Groq returned an empty code-stub translation — try Generate again.' });
+    }
     res.json({ ok: true, code: out, model: MODEL });
   });
 });
@@ -468,6 +488,9 @@ router.post('/fix-solution', function(req, res) {
       .replace(/^```[a-zA-Z]*\n?/, '')
       .replace(/```$/, '')
       .trim();
+    if (!fixed) {
+      return res.status(500).json({ error: 'Groq returned an empty fix — try Run tests again.' });
+    }
     res.json({ ok: true, code: fixed, model: MODEL });
   });
 });
