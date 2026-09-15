@@ -19,6 +19,22 @@ const MAX_FIX_ATTEMPTS = 3;
 // no other variants (Java11, "C (17)", etc.) are supported.
 const LANGUAGES = ['Python', 'Java', 'Java17', 'Java21', 'C++', 'C'];
 
+// "Java", "Java17", "Java21" aren't different languages — they're JVM
+// version tags for the SAME language, and older Java source is virtually
+// always valid as-is on a newer JVM (Java is backward compatible; nothing
+// requires modernizing `for` loops to `var`, try-with-resources rewrites,
+// etc. for the code to WORK). CONFIRMED live, repeatedly: asking the AI to
+// "translate" between these anyway doesn't modernize anything useful — it
+// just introduces real bugs while doing it (an empty solution, a header
+// missing a trailing semicolon, a stray leading semicolon in the solution —
+// three separate corruption incidents, all specifically on a same-family
+// Java-to-Java translation). Skip AI translation entirely for this case and
+// copy the source verbatim — faster, and zero risk of this class of bug.
+const JAVA_FAMILY = new Set(['java', 'java17', 'java21']);
+function sameJavaFamily(a, b) {
+  return JAVA_FAMILY.has(String(a || '').toLowerCase()) && JAVA_FAMILY.has(String(b || '').toLowerCase());
+}
+
 // The one solution marked "Best Solution" on the portal for this question
 // (falls back to the first solution with code if nothing is marked best —
 // covers questions from before that flag existed/was ever set). Returns
@@ -370,6 +386,20 @@ export default function Step6AddSolutions() {
     // previous run result, since it belonged to the old code.
     setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], loading: true, error: null, stopped: false, pushed: false, pushError: null, runResult: null, runError: null, fixAttempt: 0 } }));
     try {
+      // Same-family Java shortcut — see JAVA_FAMILY comment above. Applies
+      // whether or not this question uses the header/footer/codeStub
+      // pattern: either way, the source is ALREADY valid Java for the
+      // target version, so there's nothing to translate — copy verbatim.
+      if (sameJavaFamily(best.language, targetLanguage)) {
+        setGen(prev => ({ ...prev, [q.id]: {
+          ...prev[q.id], code: best.code, language: targetLanguage, loading: false, error: null,
+          hasSnippet: best.hasSnippet, header: best.header, footer: best.footer, codeStub: best.codeStub
+        } }));
+        const snippet = (best.header || best.footer) ? { header: best.header, footer: best.footer } : undefined;
+        const result = await verifyAndFix(q, best.code, targetLanguage, snippet, signal);
+        return { ...result, language: targetLanguage, hasSnippet: best.hasSnippet, header: best.header, footer: best.footer, codeStub: best.codeStub };
+      }
+
       // Detect on actual header/footer/codeStub CONTENT, not the `hasSnippet`
       // flag — CONFIRMED via a real captured question: hasSnippet can be
       // false while codeStub still holds real content, so the flag alone
