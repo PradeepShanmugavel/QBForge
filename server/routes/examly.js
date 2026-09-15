@@ -8,6 +8,22 @@ const router = express.Router();
 const BASE = process.env.EXAMLY_BASE_URL || 'https://api.examly.io';
 const SCHOOL_ID = process.env.SCHOOL_ID || '';
 
+// Cache + in-flight dedup for the expensive test-name -> questions
+// resolution pipeline below (GET /tests/:name/questions). CONFIRMED live:
+// nothing here stopped the same search from being fired multiple times
+// concurrently (e.g. a held-down Enter key, or a second click before the
+// button's disabled state re-rendered) — each duplicate independently
+// re-ran the WHOLE cascade (fast path, tag path, content-library scan,
+// full scan), multiplying load against Examly's API (their own 429s,
+// visible as "scan of QB X failed -> 429" in logs) and against this
+// process's own limited memory, which is what tipped a free-tier
+// container into an OOM restart. Also solves a separate, previously-
+// raised complaint: re-searching the SAME already-resolved test redid
+// the entire pipeline from scratch instead of reusing the result.
+var TEST_RESOLVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min — long enough to skip a quick re-search, short enough not to serve stale data for long
+var testResolveCache = new Map();   // normalised name -> { status, payload, expiresAt }
+var testResolveInFlight = new Map(); // normalised name -> Promise<{ status, payload }>
+
 // Built-in default department UUIDs (from the live portal request payload).
 // Override by creating server/departments.json or setting DEPARTMENT_IDS in .env.
 const DEFAULT_DEPARTMENT_IDS = [
@@ -818,6 +834,49 @@ router.get('/tests/:name/questions', function(req, res) {
 
   var term = String(req.params.name || '').trim();
   if (!term) return res.status(400).json({ error: '"name" is required' });
+
+  var cacheKey = normName(term);
+
+  var cached = testResolveCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    console.log('[EXAMLY] auto-QB: serving cached resolution for "' + term + '" (no re-scan)');
+    return res.status(cached.status).json(cached.payload);
+  }
+
+  var inFlight = testResolveInFlight.get(cacheKey);
+  if (inFlight) {
+    console.log('[EXAMLY] auto-QB: "' + term + '" already resolving — joining that instead of starting a duplicate scan');
+    return inFlight.then(function(r) { res.status(r.status).json(r.payload); })
+      .catch(function() { res.status(500).json({ error: 'Resolution failed — try again.' }); });
+  }
+
+  var resolveInFlight;
+  var inFlightPromise = new Promise(function(resolve) { resolveInFlight = resolve; });
+  testResolveInFlight.set(cacheKey, inFlightPromise);
+  // Safety net: if something ends this response without ever going through
+  // the wrapped res.json below (shouldn't happen — every exit path in this
+  // route funnels through res.json/handleErr — but a crash mid-request is
+  // still possible), don't let the in-flight entry wedge future searches
+  // for this name forever.
+  var inFlightTimeout = setTimeout(function() {
+    testResolveInFlight.delete(cacheKey);
+    resolveInFlight({ status: 500, payload: { error: 'Resolution timed out.' } });
+  }, 5 * 60 * 1000);
+
+  var realJson = res.json.bind(res);
+  res.json = function(payload) {
+    clearTimeout(inFlightTimeout);
+    var status = res.statusCode || 200;
+    var result = { status: status, payload: payload };
+    if (status === 200) {
+      // Don't cache errors/not-found — a typo'd search that gets corrected
+      // should hit fresh, not a stale 404.
+      testResolveCache.set(cacheKey, { status: status, payload: payload, expiresAt: Date.now() + TEST_RESOLVE_CACHE_TTL_MS });
+    }
+    testResolveInFlight.delete(cacheKey);
+    resolveInFlight(result);
+    return realJson(payload);
+  };
 
   var searchBody = {
     page: 1, limit: 25, search: term,

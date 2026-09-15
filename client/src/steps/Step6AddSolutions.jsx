@@ -244,6 +244,16 @@ export default function Step6AddSolutions() {
   // together (e.g. "...Day 19_PAH" vs "...Day 19_CE" — sibling tests in the
   // same series would otherwise get merged into one confusing result).
   async function handleFind() {
+    // Re-entrancy guard: the Find button is disabled while loadingQs, but
+    // that's a React re-render behind the click — a held-down/rapid Enter
+    // key in either input (both call handleFind on keydown, unconditionally)
+    // could fire a second search before the disabled state actually applied.
+    // CONFIRMED live: without this, duplicate concurrent searches for the
+    // same test each independently re-ran the entire expensive resolution
+    // pipeline, multiplying load and 429s. See also the input `disabled`
+    // props below, which stop Enter from refiring in the first place.
+    if (loadingQs) return;
+
     const testName = testNameInput.trim();
     const qbName = qbNameInput.trim();
     if (!testName && !qbName) { setQStatus({ type: 'err', msg: 'Enter a test name or a QB name.' }); return; }
@@ -711,6 +721,7 @@ export default function Step6AddSolutions() {
               value={testNameInput}
               onChange={e => setTestNameInput(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') handleFind(); }}
+              disabled={loadingQs}
             />
           </div>
           <div className="or-divider">or</div>
@@ -722,6 +733,7 @@ export default function Step6AddSolutions() {
               value={qbNameInput}
               onChange={e => setQbNameInput(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') handleFind(); }}
+              disabled={loadingQs}
             />
           </div>
         </div>
