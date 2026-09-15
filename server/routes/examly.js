@@ -1170,6 +1170,21 @@ router.get('/tests/:name/questions', function(req, res) {
                   // 429'd), so kept at low concurrency and relies on
                   // reqRetry's 429 backoff. Only reached if every targeted
                   // path above came up empty.
+                  //
+                  // REVERTED a paginated (up to 1,000-QB) version of this —
+                  // CONFIRMED live it was actively harmful, not just slow:
+                  // a real run took 25+ minutes and still ended in a hard
+                  // failure. The bottleneck isn't page count, it's that a
+                  // meaningful fraction of individual QB scans hit Examly's
+                  // own rate limit and each retry (reqRetry, up to 5
+                  // attempts, capped at 15s/attempt) adds real wall-clock
+                  // time — multiplying that across hundreds more QBs turned
+                  // a bounded search into something that could never
+                  // realistically finish within one interactive request.
+                  // Back to a single page (200 QBs): slower to reach full
+                  // coverage on a 19,000+ QB account, but it actually
+                  // returns. Whatever's left goes to the guaranteed fallback
+                  // below exactly as before.
                   console.log('[EXAMLY] auto-QB: still ' + remaining.size + ' id(s) unresolved, falling back to full QB scan...');
                   var qbListBody = baseBody({ page: 1, limit: 200, visibility: 'All' });
                   return epost('/api/v2/questionbanks', qbListBody, token).then(function(qbr) {
