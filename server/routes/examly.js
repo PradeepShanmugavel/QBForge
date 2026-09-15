@@ -1055,6 +1055,60 @@ router.get('/tests/:name/questions', function(req, res) {
             .then(function() {
               if (remaining.size === 0) { respond(); return; }
 
+              // SEGMENT PATH: the fast path above only tried the test's
+              // FULL literal name as a QB search term — but a cohort's QBs
+              // are very often named with just a SHARED PREFIX/segment of
+              // the test name (e.g. test "VIT_Assessment_4_COD_File
+              // Handling_Checking" drawing from QBs named "VIT_..."), not
+              // the full name verbatim, and CONFIRMED live not always
+              // reachable via the questions' own topic tags either (a real
+              // case: the tag path below found 87 candidate QBs and scanned
+              // every one without a single match). Split the test name into
+              // its significant segments and search QB names for each —
+              // cheap (a handful of requests) and targets the institution/
+              // batch-specific naming convention directly instead of
+              // relying on the full scan's first-200-only coverage.
+              var SEGMENT_STOPWORDS = { assessment: 1, checking: 1, final: 1, test: 1,
+                day: 1, batch: 1, cod: 1, code: 1, program: 1, session: 1, set: 1,
+                v1: 1, v2: 1, v3: 1, mcq: 1, coding: 1 };
+              var nameSegments = new Set();
+              term.split(/[_\s]+/).forEach(function(seg) {
+                var s = seg.trim();
+                if (s.length >= 3 && !/^\d+$/.test(s) && !SEGMENT_STOPWORDS[s.toLowerCase()]) nameSegments.add(s);
+              });
+
+              if (!nameSegments.size) {
+                console.log('[EXAMLY] auto-QB: segment path — no usable segment in test name, skipping to tag search');
+                return;
+              }
+              console.log('[EXAMLY] auto-QB: segment path — searching QBs by test-name segment(s): ' + Array.from(nameSegments).join(', '));
+              return mapWithConcurrency(Array.from(nameSegments), 3, function(seg) {
+                var segBody = baseBody({ page: 1, limit: 25, visibility: 'All', search: seg });
+                return epost('/api/v2/questionbanks', segBody, token)
+                  .then(function(r) {
+                    var qbs = normalise(r.data);
+                    console.log('[EXAMLY] auto-QB: segment "' + seg + '" -> ' + qbs.length + ' QB(s)');
+                    return qbs;
+                  })
+                  .catch(function(err) {
+                    console.log('[EXAMLY] auto-QB: segment "' + seg + '" search failed -> ' + ((err.response && err.response.status) || err.message));
+                    return [];
+                  });
+              }).then(function(lists) {
+                var seen = {};
+                var candidates = [];
+                lists.forEach(function(qbs) {
+                  qbs.forEach(function(qb) {
+                    if (qb.id && !seen[qb.id]) { seen[qb.id] = true; candidates.push(qb); }
+                  });
+                });
+                console.log('[EXAMLY] auto-QB: segment path — ' + candidates.length + ' distinct QB(s) across all segment searches, scanning...');
+                return mapWithConcurrency(candidates, 3, scanQb);
+              });
+            })
+            .then(function() {
+              if (remaining.size === 0) { respond(); return; }
+
               // TAG PATH: CONFIRMED live — a question's own tags (from the
               // direct-lookup cache above, learning.tags) name its topic
               // directly (e.g. "Inheritance"), and this account's QB names
