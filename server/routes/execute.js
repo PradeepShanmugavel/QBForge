@@ -93,6 +93,29 @@ function runProcess(cmd, args, input, cwd, timeoutMs) {
   });
 }
 
+// Finds the Java class name this source file should be compiled/run as.
+// Java's own rule: if a `public class X` exists, the file MUST be named
+// X.java (so that takes priority when present). Otherwise there's no
+// naming constraint at all, but we still need to invoke `java` with
+// whatever class actually contains the entry point — found by searching
+// backwards from `public static void main(...)` for the nearest preceding
+// `class X` declaration (the one it's presumably nested directly inside).
+// Returns null if no class/main method can be found at all (caller falls
+// back to a plain "Main" guess).
+function findJavaMainClassName(code) {
+  var publicMatch = code.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+(\w+)/);
+  if (publicMatch) return publicMatch[1];
+
+  var mainIdx = code.search(/public\s+static\s+void\s+main\s*\(\s*String/);
+  if (mainIdx === -1) return null;
+  var before = code.slice(0, mainIdx);
+  var classDecls = before.match(/\bclass\s+\w+/g);
+  if (!classDecls || !classDecls.length) return null;
+  var lastDecl = classDecls[classDecls.length - 1];
+  var nameMatch = lastDecl.match(/\bclass\s+(\w+)/);
+  return nameMatch ? nameMatch[1] : null;
+}
+
 // One compile step (if needed) + a run-per-testcase step, per language.
 // Returns { compileError } if compilation failed, or null if compilation
 // succeeded / wasn't needed.
@@ -136,14 +159,20 @@ function prepare(language, code, dir) {
   }
 
   if (lang.indexOf('java') !== -1) {
-    // Our generated Java code always uses `public class Main` (matches the
-    // established convention already used elsewhere in this app), so the
-    // filename must be Main.java for javac to accept it.
-    var javaFile = path.join(dir, 'Main.java');
+    // CONFIRMED live: NOT every question's footer names its entry-point
+    // class "Main" — plenty do (and this used to just assume that), but
+    // real questions also use custom names ("LibrarySystem",
+    // "VehicleRentalApp", "MealPlanCostCalculator", ...). Hardcoding `java
+    // -cp dir Main` broke on every one of those: javac compiled fine (no
+    // class named "Main" is required for that), but `java` then failed with
+    // "Could not find or load main class Main" since no such class existed.
+    // Detect the real entry-point class instead of assuming one.
+    var mainClassName = findJavaMainClassName(code) || 'Main';
+    var javaFile = path.join(dir, mainClassName + '.java');
     fs.writeFileSync(javaFile, code, 'utf8');
     return runProcess('javac', [javaFile], null, dir, COMPILE_TIMEOUT_MS).then(function(r) {
       if (!r.ok) return { compileError: r.error };
-      return { run: function(input) { return runProcess('java', ['-cp', dir, 'Main'], input, dir, JAVA_RUN_TIMEOUT_MS); } };
+      return { run: function(input) { return runProcess('java', ['-cp', dir, mainClassName], input, dir, JAVA_RUN_TIMEOUT_MS); } };
     });
   }
 
