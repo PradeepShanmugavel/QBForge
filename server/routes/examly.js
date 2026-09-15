@@ -1060,11 +1060,22 @@ router.get('/tests/:name/questions', function(req, res) {
               // are very often named with just a SHARED PREFIX/segment of
               // the test name (e.g. test "VIT_Assessment_4_COD_File
               // Handling_Checking" drawing from QBs named "VIT_..."), not
-              // the full name verbatim. Split the test name into its
-              // significant segments and search QB names for each — cheap
-              // (a handful of requests) and targets the institution/batch-
-              // specific naming convention directly instead of relying on
-              // the full scan's first-200-only coverage.
+              // the full name verbatim.
+              //
+              // CONFIRMED live against the real API (direct curl, real
+              // case): Examly's QB search does LITERAL SUBSTRING matching
+              // on qb_name, not fuzzy/word matching — "VIT File Handling"
+              // (words joined with a space that never appears in any real
+              // QB name) returns 0 hits, while "File Handling" (the exact
+              // phrase, as it actually appears inside "VIT V_Java_FAT_COD_
+              // File Handling") returns 86. So splitting on EVERY space AND
+              // underscore was actively counter-productive — it broke
+              // "File Handling" into two independent single-word searches,
+              // each far too generic (25+ hits, real target buried past
+              // page 1) to ever pass along "VIT" (353 hits company-wide,
+              // hopeless to page through). Splitting on underscores ONLY
+              // keeps "File Handling" intact as one precise phrase, which
+              // is exactly what let this same case resolve in one request.
               //
               // NOTE: a prior "tag path" here searched by each question's
               // own topic tags instead of the test name (e.g. "Inheritance",
@@ -1079,23 +1090,35 @@ router.get('/tests/:name/questions', function(req, res) {
               var SEGMENT_STOPWORDS = { assessment: 1, checking: 1, final: 1, test: 1,
                 day: 1, batch: 1, cod: 1, code: 1, program: 1, session: 1, set: 1,
                 v1: 1, v2: 1, v3: 1, mcq: 1, coding: 1 };
+              var SEGMENT_FETCH_LIMIT = 100;
+              // Too-generic guard: a segment whose total match count exceeds
+              // what we actually fetch (e.g. "VIT" alone -> 353 hits) can't
+              // be meaningfully scanned from page 1 alone — skip it rather
+              // than burn requests scanning a near-random subset that's
+              // very unlikely to include the real target.
+              var SEGMENT_MAX_USABLE_COUNT = SEGMENT_FETCH_LIMIT;
               var nameSegments = new Set();
-              term.split(/[_\s]+/).forEach(function(seg) {
+              term.split(/_+/).forEach(function(seg) {
                 var s = seg.trim();
                 if (s.length >= 3 && !/^\d+$/.test(s) && !SEGMENT_STOPWORDS[s.toLowerCase()]) nameSegments.add(s);
               });
 
               if (!nameSegments.size) {
-                console.log('[EXAMLY] auto-QB: segment path — no usable segment in test name, skipping to tag search');
+                console.log('[EXAMLY] auto-QB: segment path — no usable segment in test name, skipping to content-library search');
                 return;
               }
               console.log('[EXAMLY] auto-QB: segment path — searching QBs by test-name segment(s): ' + Array.from(nameSegments).join(', '));
               return mapWithConcurrency(Array.from(nameSegments), 3, function(seg) {
-                var segBody = baseBody({ page: 1, limit: 25, visibility: 'All', search: seg });
+                var segBody = baseBody({ page: 1, limit: SEGMENT_FETCH_LIMIT, visibility: 'All', search: seg });
                 return epost('/api/v2/questionbanks', segBody, token)
                   .then(function(r) {
                     var qbs = normalise(r.data);
-                    console.log('[EXAMLY] auto-QB: segment "' + seg + '" -> ' + qbs.length + ' QB(s)');
+                    var total = (r.data.results && r.data.results.count) || qbs.length;
+                    if (total > SEGMENT_MAX_USABLE_COUNT) {
+                      console.log('[EXAMLY] auto-QB: segment "' + seg + '" -> ' + total + ' QB(s) total, too generic to page through — skipping');
+                      return [];
+                    }
+                    console.log('[EXAMLY] auto-QB: segment "' + seg + '" -> ' + qbs.length + ' of ' + total + ' QB(s)');
                     return qbs;
                   })
                   .catch(function(err) {
