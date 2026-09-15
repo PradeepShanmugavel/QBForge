@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { useApp } from '../store/AppContext';
 import { getTestQuestions, searchTests, resolveQBNames, getQBQuestions, pushSolution } from '../api/examlyAPI';
 import { translateSolution, translateFragment, translateStub, fixSolution } from '../api/groqAPI';
@@ -119,6 +119,23 @@ export default function Step6AddSolutions() {
   // "Update selected" run — separate from each question's own per-row
   // dropdown, so you don't have to set them one by one before bulk-running.
   const [bulkLanguage, setBulkLanguage] = useState(LANGUAGES[0]);
+
+  // id -> AbortController for that question's in-flight generate (Stop
+  // button below). Refs, not state — aborting doesn't need a re-render by
+  // itself, and a new controller must be created per generate WITHOUT
+  // waiting on a state update round-trip.
+  const abortControllersRef = useRef({});
+  // One shared controller for whichever question a bulk run ("Generate all"
+  // / "Update selected") is CURRENTLY processing, so Stop can cancel the
+  // in-flight request immediately instead of only stopping before the next
+  // question. Paired with a plain boolean (not state) the loop polls
+  // between iterations to stop moving on to further questions at all.
+  const bulkAbortControllerRef = useRef(null);
+  const bulkStopRequestedRef = useRef(false);
+
+  function isAbortError(err) {
+    return err && (err.name === 'CanceledError' || err.code === 'ERR_CANCELED' || err.message === 'canceled');
+  }
 
   function languageFor(q) {
     return pushLangByQ[q.id] || LANGUAGES[0];
@@ -264,7 +281,7 @@ export default function Step6AddSolutions() {
   // concatenated (a real compileable program), but any auto-fix keeps
   // operating on just the middle (see fixSolution's header/footer params) —
   // so header/footer never drift from what was actually translated.
-  async function verifyAndFix(q, initialCode, language, snippet) {
+  async function verifyAndFix(q, initialCode, language, snippet, signal) {
     const cases = testCasesOf(q);
     if (!cases.length) {
       setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], runError: 'No test cases found on this question — cannot verify automatically.' } }));
@@ -280,8 +297,9 @@ export default function Step6AddSolutions() {
       setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], running: true, runError: null, fixAttempt: attempt } }));
       let rr;
       try {
-        rr = await runTests(language, fullOf(code), cases);
+        rr = await runTests(language, fullOf(code), cases, signal);
       } catch (err) {
+        if (isAbortError(err)) { setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], running: false, stopped: true } })); return { passed: false, code, stopped: true }; }
         setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], running: false, runError: err.response?.data?.error || err.message } }));
         return { passed: false, code };
       }
@@ -304,8 +322,9 @@ export default function Step6AddSolutions() {
       setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], fixing: true } }));
       let fixRes;
       try {
-        fixRes = await fixSolution({ code, language, question_text: q.title, failures, header, footer });
+        fixRes = await fixSolution({ code, language, question_text: q.title, failures, header, footer }, signal);
       } catch (err) {
+        if (isAbortError(err)) { setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], fixing: false, stopped: true } })); return { passed: false, code, stopped: true }; }
         setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], fixing: false, runError: err.response?.data?.error || err.message } }));
         return { passed: false, code };
       }
@@ -328,18 +347,28 @@ export default function Step6AddSolutions() {
   // Returns { passed, code, language } (see verifyAndFix) so bulk operations
   // know whether — and with exactly what — to push, or { passed: false }
   // if translation itself failed.
-  async function generateFor(q, languageOverride) {
+  // `externalSignal` (optional): when a bulk run ("Generate all" / "Update
+  // selected") is driving this call, it supplies its OWN shared
+  // AbortController's signal so its single Stop button cancels whichever
+  // question is currently in flight — generateFor doesn't create its own
+  // controller in that case. Standalone (clicking Generate on one row)
+  // creates and owns its own controller, stored in abortControllersRef so
+  // this row's own Stop button can abort just this one.
+  async function generateFor(q, languageOverride, externalSignal) {
     const best = bestSolutionOf(q);
     // Capture the target language NOW — if this question's dropdown changes
     // before this resolves, or before Push is clicked, the generated code
     // must stay paired with the language it was actually generated in.
     const targetLanguage = languageOverride || languageFor(q);
+    const ownController = externalSignal ? null : new AbortController();
+    if (ownController) abortControllersRef.current[q.id] = ownController;
+    const signal = externalSignal || (ownController && ownController.signal);
     // Reset pushed/pushError — without this, once ANY language had been
     // pushed for this question, the Push button stayed disabled forever
     // (e.pushed never went back to false), blocking pushing a second,
     // different language for the same question afterward. Also reset any
     // previous run result, since it belonged to the old code.
-    setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], loading: true, error: null, pushed: false, pushError: null, runResult: null, runError: null, fixAttempt: 0 } }));
+    setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], loading: true, error: null, stopped: false, pushed: false, pushError: null, runResult: null, runError: null, fixAttempt: 0 } }));
     try {
       // Detect on actual header/footer/codeStub CONTENT, not the `hasSnippet`
       // flag — CONFIRMED via a real captured question: hasSnippet can be
@@ -360,7 +389,7 @@ export default function Step6AddSolutions() {
         // translation needs it as context to match naming/structure.
         const solRes = await translateSolution({
           code: best.code || '', fromLanguage, toLanguage: targetLanguage, question_text: q.title
-        });
+        }, signal);
         if (!solRes.ok) throw new Error(solRes.error || 'Translation failed');
 
         // Sequential, not Promise.all — CONFIRMED live that 4 Groq calls per
@@ -368,12 +397,12 @@ export default function Step6AddSolutions() {
         // limit (429s), especially across several questions in a row. A bit
         // slower per question, but far fewer rate-limit failures overall.
         const headerRes = best.header
-          ? await translateFragment({ code: best.header, fromLanguage, toLanguage: targetLanguage, kind: 'header' })
+          ? await translateFragment({ code: best.header, fromLanguage, toLanguage: targetLanguage, kind: 'header' }, signal)
           : { ok: true, code: '' };
         if (!headerRes.ok) throw new Error(headerRes.error || 'Header translation failed');
 
         const footerRes = best.footer
-          ? await translateFragment({ code: best.footer, fromLanguage, toLanguage: targetLanguage, kind: 'footer' })
+          ? await translateFragment({ code: best.footer, fromLanguage, toLanguage: targetLanguage, kind: 'footer' }, signal)
           : { ok: true, code: '' };
         if (!footerRes.ok) throw new Error(footerRes.error || 'Footer translation failed');
 
@@ -381,7 +410,7 @@ export default function Step6AddSolutions() {
           ? await translateStub({
               codeStub: best.codeStub, originalSolution: best.code || '', translatedSolution: solRes.code,
               fromLanguage, toLanguage: targetLanguage, question_text: q.title
-            })
+            }, signal)
           : { ok: true, code: '' };
         if (!stubRes.ok) throw new Error(stubRes.error || 'Code stub translation failed');
 
@@ -391,7 +420,7 @@ export default function Step6AddSolutions() {
           ...prev[q.id], code: solRes.code, language: targetLanguage, loading: false, error: null,
           hasSnippet: best.hasSnippet, header: headerRes.code, footer: footerRes.code, codeStub: stubRes.code
         } }));
-        const result = await verifyAndFix(q, solRes.code, targetLanguage, { header: headerRes.code, footer: footerRes.code });
+        const result = await verifyAndFix(q, solRes.code, targetLanguage, { header: headerRes.code, footer: footerRes.code }, signal);
         return { ...result, language: targetLanguage, hasSnippet: best.hasSnippet, header: headerRes.code, footer: footerRes.code, codeStub: stubRes.code };
       }
       const res = await translateSolution({
@@ -399,22 +428,59 @@ export default function Step6AddSolutions() {
         fromLanguage: best.language || 'the original language',
         toLanguage: targetLanguage,
         question_text: q.title
-      });
+      }, signal);
       if (!res.ok) throw new Error(res.error || 'Translation failed');
       setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], code: res.code, language: targetLanguage, loading: false, error: null, hasSnippet: false, header: '', footer: '', codeStub: '' } }));
-      const result = await verifyAndFix(q, res.code, targetLanguage);
+      const result = await verifyAndFix(q, res.code, targetLanguage, undefined, signal);
       return { ...result, language: targetLanguage, hasSnippet: false };
     } catch (err) {
+      if (isAbortError(err)) {
+        setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], loading: false, stopped: true } }));
+        return { passed: false, stopped: true };
+      }
       setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], loading: false, error: err.response?.data?.error || err.message } }));
       return { passed: false };
+    } finally {
+      if (ownController) delete abortControllersRef.current[q.id];
     }
   }
 
+  // Aborts a specific question's own in-flight generate (only meaningful
+  // when it owns its own controller — i.e. not currently driven by a bulk
+  // run, which uses stopBulk() instead since it shares one controller).
+  function stopFor(q) {
+    var controller = abortControllersRef.current[q.id];
+    if (controller) controller.abort();
+  }
+
   async function generateAll() {
-    for (const q of questions) {
-      if (!bestSolutionOf(q).code) continue; // nothing to translate from
-      await generateFor(q);
+    const targets = questions.filter(q => bestSolutionOf(q).code);
+    if (!targets.length) return;
+
+    bulkStopRequestedRef.current = false;
+    setBulkRunning(true);
+    setBulkProgress({ done: 0, total: targets.length });
+    for (let i = 0; i < targets.length; i++) {
+      if (bulkStopRequestedRef.current) break;
+      const q = targets[i];
+      const controller = new AbortController();
+      bulkAbortControllerRef.current = controller;
+      await generateFor(q, undefined, controller.signal);
+      bulkAbortControllerRef.current = null;
+      setBulkProgress({ done: i + 1, total: targets.length });
     }
+    setBulkRunning(false);
+    bulkStopRequestedRef.current = false;
+  }
+
+  // Cancels whichever bulk run ("Generate all" / "Update selected") is
+  // currently in progress: aborts the CURRENTLY in-flight request via the
+  // shared controller, and stops the loop from starting any further
+  // question. A question already pushed stays pushed — only the questions
+  // not yet reached are skipped.
+  function stopBulk() {
+    bulkStopRequestedRef.current = true;
+    if (bulkAbortControllerRef.current) bulkAbortControllerRef.current.abort();
   }
 
   // Runs the FULL pipeline (generate -> verify -> auto-fix -> push) for every
@@ -428,15 +494,21 @@ export default function Step6AddSolutions() {
     const targets = questions.filter(q => ids.includes(String(q.id)) && bestSolutionOf(q).code && !q.qbUnresolved);
     if (!targets.length) return;
 
+    bulkStopRequestedRef.current = false;
     setBulkRunning(true);
     setBulkProgress({ done: 0, total: targets.length });
     for (let i = 0; i < targets.length; i++) {
+      if (bulkStopRequestedRef.current) break;
       const q = targets[i];
       // Reflect the bulk language choice in this question's own dropdown too
       // (display only — generateFor gets it explicitly below, so this can't
       // introduce the same staleness issue the override params exist to avoid).
       setPushLangByQ(prev => ({ ...prev, [q.id]: bulkLanguage }));
-      const result = await generateFor(q, bulkLanguage);
+      const controller = new AbortController();
+      bulkAbortControllerRef.current = controller;
+      const result = await generateFor(q, bulkLanguage, controller.signal);
+      bulkAbortControllerRef.current = null;
+      if (bulkStopRequestedRef.current) { setBulkProgress({ done: i + 1, total: targets.length }); break; }
       if (result.passed) {
         await pushFor(q, {
           code: result.code, language: result.language,
@@ -446,6 +518,7 @@ export default function Step6AddSolutions() {
       setBulkProgress({ done: i + 1, total: targets.length });
     }
     setBulkRunning(false);
+    bulkStopRequestedRef.current = false;
   }
 
   function editCode(id, code) {
@@ -458,7 +531,14 @@ export default function Step6AddSolutions() {
     if (!entry?.code) return;
     const language = entry.language || languageFor(q);
     const snippet = (entry.header || entry.footer) ? { header: entry.header, footer: entry.footer } : undefined;
-    await verifyAndFix(q, entry.code, language, snippet);
+    const controller = new AbortController();
+    abortControllersRef.current[q.id] = controller;
+    setGen(prev => ({ ...prev, [q.id]: { ...prev[q.id], stopped: false } }));
+    try {
+      await verifyAndFix(q, entry.code, language, snippet, controller.signal);
+    } finally {
+      delete abortControllersRef.current[q.id];
+    }
   }
 
   async function copyFor(q) {
@@ -689,11 +769,14 @@ export default function Step6AddSolutions() {
                   ? `Updating ${bulkProgress ? bulkProgress.done : 0}/${bulkProgress ? bulkProgress.total : 0}...`
                   : `🚀 Update selected (${Object.values(selectedIds).filter(Boolean).length})`}
               </button>
+              {bulkRunning && (
+                <button className="btn btn-xs btn-danger" onClick={stopBulk}>⏹ Stop</button>
+              )}
             </div>
           </div>
           {bulkRunning && (
             <StatusMsg loading>
-              Updating selected question(s) one at a time — generate, verify, auto-fix, push ({bulkProgress?.done || 0}/{bulkProgress?.total || 0} done)...
+              Running one question at a time — generate, verify, auto-fix, push ({bulkProgress?.done || 0}/{bulkProgress?.total || 0} done)...
             </StatusMsg>
           )}
 
@@ -868,6 +951,7 @@ export default function Step6AddSolutions() {
                 )}
                 {e.pushError && <StatusMsg type="err">{e.pushError}</StatusMsg>}
                 {e.pushed && <StatusMsg type="ok">Pushed to the portal.</StatusMsg>}
+                {e.stopped && <StatusMsg type="warn">Stopped.</StatusMsg>}
                 {q.qbUnresolved && (
                   <StatusMsg type="warn">
                     Couldn't determine which QB this question lives in, so it's shown for review/generation only —
@@ -876,22 +960,39 @@ export default function Step6AddSolutions() {
                   </StatusMsg>
                 )}
 
-                {best.code && (
-                  <div className="actions-row">
-                    <button className="btn btn-xs btn-secondary" onClick={() => generateFor(q)} disabled={e.loading || e.running || e.fixing || bulkRunning}>
-                      {e.loading ? 'Generating...' : '🤖 Generate'}
-                    </button>
+                {best.code && (() => {
+                  // Busy = actually generating/running/fixing right now, whether
+                  // driven by this row's own buttons or by a bulk run currently
+                  // on this question. Stop maps to whichever started it — the
+                  // bulk-wide stop when a bulk run is in progress (so one click
+                  // stops the whole run, not just this row), this row's own
+                  // controller otherwise.
+                  const busy = e.loading || e.running || e.fixing;
+                  const stopHandler = bulkRunning ? stopBulk : () => stopFor(q);
+                  return (
+                    <div className="actions-row">
+                      {busy ? (
+                        <button className="btn btn-xs btn-danger" onClick={stopHandler}>⏹ Stop</button>
+                      ) : (
+                        <button className="btn btn-xs btn-secondary" onClick={() => generateFor(q)} disabled={bulkRunning}>
+                          🤖 Generate
+                        </button>
+                      )}
+                      {busy && (
+                        <span className="muted-note">{e.loading ? 'Generating...' : e.fixing ? 'Fixing...' : 'Running...'}</span>
+                      )}
                     <button className="btn btn-xs btn-secondary" onClick={() => copyFor(q)} disabled={!e.code}>
                       {e.copied ? '✓ Copied' : '📋 Copy code'}
                     </button>
-                    <button className="btn btn-xs btn-secondary" onClick={() => runTestsFor(q)} disabled={!e.code || e.running || e.fixing || languageMismatch || bulkRunning}>
-                      {e.fixing ? 'Fixing...' : e.running ? 'Running...' : '▶️ Run tests'}
+                    <button className="btn btn-xs btn-secondary" onClick={() => runTestsFor(q)} disabled={!e.code || busy || languageMismatch || bulkRunning}>
+                      ▶️ Run tests
                     </button>
-                    <button className="btn btn-xs btn-success" onClick={() => pushFor(q)} disabled={!e.code || e.pushing || e.pushed || languageMismatch || e.running || e.fixing || !verified || bulkRunning || q.qbUnresolved}>
+                    <button className="btn btn-xs btn-success" onClick={() => pushFor(q)} disabled={!e.code || e.pushing || e.pushed || languageMismatch || busy || !verified || bulkRunning || q.qbUnresolved}>
                       {e.pushing ? 'Pushing...' : e.pushed ? '✓ Pushed' : '🚀 Push this one'}
                     </button>
                   </div>
-                )}
+                  );
+                })()}
               </div>
             );
           })}

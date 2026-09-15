@@ -96,11 +96,19 @@ function headers(token) {
   return h;
 }
 
-// Transient network errors that are worth retrying.
+// Transient network errors worth retrying — CONFIRMED live: ECONNABORTED
+// (axios's own request-timeout code, fired when Examly itself doesn't
+// respond within our 25s timeout) does NOT belong here. Retrying a timeout
+// with the SAME 25s timeout compounded into 5 x 25s = 125+ seconds of
+// silent waiting before finally failing on one slow/hanging Examly search —
+// if it didn't respond in 25s once, another attempt at the identical
+// timeout essentially never helps, it just multiplies the wait for nothing.
+// The other codes here are genuine fast-failing connection blips (a reset,
+// DNS hiccup, etc.) where a quick retry can actually help.
 function isTransient(e) {
   var c = e && e.code;
   return c === 'ECONNRESET' || c === 'ETIMEDOUT' || c === 'ENOTFOUND' ||
-         c === 'EAI_AGAIN' || c === 'ECONNABORTED' ||
+         c === 'EAI_AGAIN' ||
          (e && /socket hang up/i.test(e.message || ''));
 }
 
@@ -984,6 +992,58 @@ router.get('/tests/:name/questions', function(req, res) {
             })
             .catch(function(err) {
               console.log('[EXAMLY] auto-QB: fast path search failed (' + ((err.response && err.response.status) || err.message) + '), skipping to full scan');
+            })
+            .then(function() {
+              if (remaining.size === 0) { respond(); return; }
+
+              // TAG PATH: CONFIRMED live — a question's own tags (from the
+              // direct-lookup cache above, learning.tags) name its topic
+              // directly (e.g. "Inheritance"), and this account's QB names
+              // encode that same topic (e.g. "NeoColab_JAVA_COD_Debugging_
+              // Inheritance", "NeoColab_Java_COD_Single Inheritance"). Far
+              // more targeted than a blind "every QB named NeoColab" search —
+              // searching by the actual topic word returns a small, relevant
+              // candidate set instead of hundreds of unrelated QBs.
+              var GENERIC_TAGS = { java: 1, python: 1, c: 1, 'c++': 1, cpp: 1,
+                snippet: 1, stub: 1, v3: 1, stverified: 1, debugging: 1 };
+              var tagTerms = new Set();
+              Array.from(remaining).forEach(function(qid) {
+                var entity = directLookupCache[qid];
+                var tags = (entity && entity.learning && entity.learning.tags) || [];
+                tags.forEach(function(t) {
+                  var name = t && t.name;
+                  if (name && !GENERIC_TAGS[String(name).toLowerCase()]) tagTerms.add(name);
+                });
+              });
+
+              if (!tagTerms.size) {
+                console.log('[EXAMLY] auto-QB: tag path — no usable topic tag on any remaining question, skipping to content-library search');
+                return;
+              }
+              console.log('[EXAMLY] auto-QB: tag path — searching QBs by topic tag(s): ' + Array.from(tagTerms).join(', '));
+              return mapWithConcurrency(Array.from(tagTerms), 3, function(term) {
+                var tagBody = baseBody({ page: 1, limit: 25, visibility: 'All', search: term });
+                return epost('/api/v2/questionbanks', tagBody, token)
+                  .then(function(r) {
+                    var qbs = normalise(r.data);
+                    console.log('[EXAMLY] auto-QB: tag "' + term + '" -> ' + qbs.length + ' QB(s)');
+                    return qbs;
+                  })
+                  .catch(function(err) {
+                    console.log('[EXAMLY] auto-QB: tag "' + term + '" search failed -> ' + ((err.response && err.response.status) || err.message));
+                    return [];
+                  });
+              }).then(function(lists) {
+                var seen = {};
+                var candidates = [];
+                lists.forEach(function(qbs) {
+                  qbs.forEach(function(qb) {
+                    if (qb.id && !seen[qb.id]) { seen[qb.id] = true; candidates.push(qb); }
+                  });
+                });
+                console.log('[EXAMLY] auto-QB: tag path — ' + candidates.length + ' distinct QB(s) across all tag searches, scanning...');
+                return mapWithConcurrency(candidates, 3, scanQb);
+              });
             })
             .then(function() {
               if (remaining.size === 0) { respond(); return; }

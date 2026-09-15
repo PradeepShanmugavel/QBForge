@@ -11,6 +11,14 @@ const MODEL = 'openai/gpt-oss-120b';
 // outlast a sustained rate-limit window. Matches REQ_RETRY_DEFAULT_TRIES
 // used for the Examly-side calls elsewhere in this app.
 const MAX_RETRIES = 5;
+// CONFIRMED live: Groq's own Retry-After header can be MINUTES long
+// (observed 380s, 584s) — that means a real quota was hit (daily/token
+// limit), not a brief burst. Blindly honoring it silently froze the UI for
+// up to ~10 minutes per attempt, up to 5 times — exactly the "not quick"
+// symptom. Cap the wait so a real quota exhaustion fails fast with a clear
+// message instead of hanging; a genuine short burst still retries fine well
+// under this cap.
+const MAX_RETRY_DELAY_MS = 15000;
 
 function safeJSON(text) {
   try {
@@ -22,15 +30,116 @@ function safeJSON(text) {
 
 function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
 
+// PROACTIVE token-bucket throttle for Groq's Tokens-Per-Minute cap.
+// CONFIRMED via the account's own Groq console Limits page: openai/gpt-oss-
+// 120b (MODEL below) is capped at 8000 tokens/minute — tight enough that
+// firing the up-to-4 substantial prompts this app sends per question (solution
+// + header + footer + codeStub, each carrying the full question text/code)
+// close together blows past it, and REACTIVE retry-after-a-429 wasn't
+// enough (Retry-After came back several MINUTES long, meaning the burst was
+// real, not a fluke). Tracks actual estimated usage in a rolling 60s window
+// and delays a call that would exceed budget, instead of firing it and
+// finding out via a 429. A rough chars/4 estimate (OpenAI-style tokenizers
+// average ~4 chars/token) is good enough for pacing purposes — doesn't need
+// to be exact, just to keep genuine usage comfortably under the real cap.
+var TPM_BUDGET = 7000; // stay under the real 8000 cap for headroom (safety margin + estimate error)
+var tokenWindow = []; // [{ at: <timestamp>, tokens: <n> }, ...] within the last 60s
+
+function estimateTokens(messages, maxTokens) {
+  var chars = messages.reduce(function(sum, m) { return sum + String((m && m.content) || '').length; }, 0);
+  return Math.ceil(chars / 4) + (maxTokens || 0); // input estimate + full possible output
+}
+
+function waitForTokenBudget(estimatedTokens) {
+  var now = Date.now();
+  tokenWindow = tokenWindow.filter(function(e) { return now - e.at < 60000; });
+  var used = tokenWindow.reduce(function(sum, e) { return sum + e.tokens; }, 0);
+  if (used + estimatedTokens <= TPM_BUDGET || !tokenWindow.length) {
+    // Reserve the budget now (before the call actually completes) so two
+    // calls issued back-to-back both see this reservation, not just one.
+    tokenWindow.push({ at: now, tokens: estimatedTokens });
+    return Promise.resolve();
+  }
+  var oldest = tokenWindow[0];
+  var waitMs = Math.max(200, 60000 - (now - oldest.at) + 200);
+  console.log('[GROQ] throttle: ~' + estimatedTokens + ' more tokens would exceed the ' + TPM_BUDGET +
+              '/min budget (~' + used + ' used in the last 60s) — waiting ' + waitMs + 'ms');
+  return wait(waitMs).then(function() { return waitForTokenBudget(estimatedTokens); });
+}
+
 // True for connection-level failures (no HTTP response at all) — TLS/socket
 // resets, timeouts, DNS blips — as opposed to a real HTTP error status from
 // Groq itself. Worth a quick retry since these are almost always transient.
+// CONFIRMED live: ECONNABORTED (axios's own request-timeout code, fired
+// when Groq doesn't respond within our 30s timeout) does NOT belong here —
+// see the identical fix in examly.js's isTransient(). Retrying a timeout
+// with the same 30s timeout, up to MAX_RETRIES times, compounded into
+// minutes of silent waiting before finally failing on one slow response.
 function isNetworkError(err) {
   if (err.response) return false; // got a real HTTP response — not a network error
   var code = err.code || '';
-  return code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNABORTED' ||
+  return code === 'ECONNRESET' || code === 'ETIMEDOUT' ||
     code === 'ENOTFOUND' || code === 'EAI_AGAIN' ||
     /socket disconnected|network|TLS/i.test(err.message || '');
+}
+
+// FALLBACK provider — used automatically whenever the primary Groq call
+// fails for ANY reason (rate limit, quota exhausted, network error) so a
+// Groq problem doesn't stop the app cold. CONFIRMED live via direct testing:
+// this model needs "reasoning":{"enabled":false} or it emits chain-of-
+// thought narration instead of a clean answer (several other free-tier
+// OpenRouter models tried the same way came back EMPTY — reasoning ate the
+// whole token budget with nothing left for the actual answer). ~120B scale,
+// roughly matching MODEL's capability above.
+var OPENROUTER_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free';
+
+function openRouterCall(messages, maxTokens) {
+  var key = process.env.OPENROUTER_API_KEY;
+  if (!key || key.indexOf('xxx') !== -1 || key.length < 20) {
+    return Promise.resolve({ ok: false, error: 'no OPENROUTER_API_KEY configured' });
+  }
+  return axios.post('https://openrouter.ai/api/v1/chat/completions', {
+    model: OPENROUTER_MODEL,
+    messages: messages,
+    max_tokens: maxTokens,
+    temperature: 0.1,
+    reasoning: { enabled: false }
+  }, {
+    headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+    timeout: 30000
+  }).then(function(r) {
+    var content = r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
+    if (!content) return { ok: false, error: 'OpenRouter returned empty content' };
+    return { ok: true, content: content, model: OPENROUTER_MODEL };
+  }).catch(function(err) {
+    var status = err.response && err.response.status;
+    var detail = (err.response && err.response.data && err.response.data.error && err.response.data.error.message) || err.message;
+    return { ok: false, error: (status || '') + ' ' + detail };
+  });
+}
+
+// Tries the primary Groq call first; on ANY failure, automatically falls
+// back to OpenRouter once before giving up for real. `label` is just for
+// logging. Returns the same { ok, content } shape either way.
+function callWithFallback(label, groqCallFn, messages, maxTokens) {
+  return groqCallFn(messages, process.env.GROQ_API_KEY).then(function(result) {
+    if (result.ok) return result;
+    console.log('[GROQ] ' + label + ': primary call failed (' + result.error + ') — falling back to OpenRouter...');
+    return openRouterCall(messages, maxTokens).then(function(orResult) {
+      if (orResult.ok) {
+        console.log('[GROQ] ' + label + ': OpenRouter fallback succeeded');
+        return orResult;
+      }
+      console.log('[GROQ] ' + label + ': OpenRouter fallback also failed (' + orResult.error + ')');
+      return { ok: false, error: 'Groq failed (' + result.error + '); OpenRouter fallback also failed (' + orResult.error + ')' };
+    });
+  });
+}
+
+// Strips markdown code fences and surrounding whitespace — shared by every
+// route that expects a plain code answer back (not qc-analyze, which is JSON).
+function cleanCodeOutput(raw) {
+  return String(raw || '').trim().replace(/^```[a-zA-Z]*\n?/, '').replace(/```\s*$/, '').trim();
 }
 
 // POST /api/groq/qc-analyze
@@ -102,6 +211,7 @@ function qcPrompt(body) {
 
 function qcCall(messages, key, attempt) {
   attempt = attempt || 1;
+  return waitForTokenBudget(estimateTokens(messages, 1200)).then(function() {
   return axios.post(GROQ_BASE + '/chat/completions', {
     model: MODEL,
     messages: messages,
@@ -110,13 +220,18 @@ function qcCall(messages, key, attempt) {
   }, {
     headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
     timeout: 30000
+  });
   }).then(function(r) {
-    return { ok: true, content: r.data.choices[0].message.content };
+    return { ok: true, content: r.data.choices[0].message.content, model: MODEL };
   }).catch(function(err) {
     var status = err.response && err.response.status;
     if (status === 429 && attempt <= MAX_RETRIES) {
       var retryAfterHeader = Number(err.response.headers && err.response.headers['retry-after']);
       var delayMs = (retryAfterHeader > 0 ? retryAfterHeader * 1000 : Math.pow(2, attempt) * 1000);
+      if (delayMs > MAX_RETRY_DELAY_MS) {
+        console.log('[GROQ] qc-analyze 429 — Retry-After ' + delayMs + 'ms exceeds the ' + MAX_RETRY_DELAY_MS + 'ms cap, failing fast (this is a real quota limit, not a brief burst)');
+        return { ok: false, error: 'Groq rate limit hit — it says to wait ' + Math.ceil(delayMs / 1000) + 's, which usually means your API key\'s quota is exhausted. Check console.groq.com for your usage/limits, or wait and try again later.' };
+      }
       console.log('[GROQ] qc-analyze 429 — retrying in ' + delayMs + 'ms (attempt ' + attempt + '/' + MAX_RETRIES + ')');
       return wait(delayMs).then(function() { return qcCall(messages, key, attempt + 1); });
     }
@@ -133,12 +248,10 @@ router.post('/qc-analyze', function(req, res) {
   var body = req.body || {};
   if (!body.question_text) return res.status(400).json({ error: 'Missing question_text in request body' });
 
-  var key = process.env.GROQ_API_KEY;
-  if (!key || key.indexOf('xxx') !== -1 || key.length < 20) {
-    return res.status(500).json({ error: 'No valid Groq API key configured on the server.' });
-  }
-
-  qcCall(qcPrompt(body), key).then(function(result) {
+  // No upfront "is the key valid" gate — callWithFallback handles a missing/
+  // bad Groq key the same as any other failure (fast-fails, tries OpenRouter
+  // next) rather than refusing to even attempt the fallback.
+  callWithFallback('qc-analyze', qcCall, qcPrompt(body), 1200).then(function(result) {
     if (!result.ok) {
       return res.status(500).json({ error: 'Groq QC analysis failed: ' + result.error });
     }
@@ -146,7 +259,7 @@ router.post('/qc-analyze', function(req, res) {
     if (!parsed) {
       return res.json({ ok: false, raw: result.content, model_used: MODEL, error: 'Could not parse AI response as JSON' });
     }
-    res.json({ ok: true, analysis: parsed, model_used: MODEL });
+    res.json({ ok: true, analysis: parsed, model_used: result.model || MODEL });
   });
 });
 
@@ -155,6 +268,7 @@ router.post('/qc-analyze', function(req, res) {
 // unlike the routes in examly.js that read/write this translated code.
 function translateCall(messages, key, attempt) {
   attempt = attempt || 1;
+  return waitForTokenBudget(estimateTokens(messages, 2000)).then(function() {
   return axios.post(GROQ_BASE + '/chat/completions', {
     model: MODEL,
     messages: messages,
@@ -163,19 +277,24 @@ function translateCall(messages, key, attempt) {
   }, {
     headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
     timeout: 30000
+  });
   }).then(function(r) {
-    return { ok: true, content: r.data.choices[0].message.content };
+    return { ok: true, content: r.data.choices[0].message.content, model: MODEL };
   }).catch(function(err) {
     var status = err.response && err.response.status;
     if (status === 429 && attempt <= MAX_RETRIES) {
       var retryAfterHeader = Number(err.response.headers && err.response.headers['retry-after']);
       var delayMs = (retryAfterHeader > 0 ? retryAfterHeader * 1000 : Math.pow(2, attempt) * 1000);
-      console.log('[GROQ] translate-solution 429 — retrying in ' + delayMs + 'ms (attempt ' + attempt + '/' + MAX_RETRIES + ')');
+      if (delayMs > MAX_RETRY_DELAY_MS) {
+        console.log('[GROQ] translate 429 — Retry-After ' + delayMs + 'ms exceeds the ' + MAX_RETRY_DELAY_MS + 'ms cap, failing fast (this is a real quota limit, not a brief burst)');
+        return { ok: false, error: 'Groq rate limit hit — it says to wait ' + Math.ceil(delayMs / 1000) + 's, which usually means your API key\'s quota is exhausted. Check console.groq.com for your usage/limits, or wait and try again later.' };
+      }
+      console.log('[GROQ] translate 429 — retrying in ' + delayMs + 'ms (attempt ' + attempt + '/' + MAX_RETRIES + ')');
       return wait(delayMs).then(function() { return translateCall(messages, key, attempt + 1); });
     }
     if (isNetworkError(err) && attempt <= MAX_RETRIES) {
       var netDelayMs = 1000 * attempt;
-      console.log('[GROQ] translate-solution network error (' + (err.code || err.message) + ') — retrying in ' + netDelayMs + 'ms (attempt ' + attempt + '/' + MAX_RETRIES + ')');
+      console.log('[GROQ] translate network error (' + (err.code || err.message) + ') — retrying in ' + netDelayMs + 'ms (attempt ' + attempt + '/' + MAX_RETRIES + ')');
       return wait(netDelayMs).then(function() { return translateCall(messages, key, attempt + 1); });
     }
     return { ok: false, error: (status || err.message) };
@@ -190,11 +309,6 @@ router.post('/translate-solution', function(req, res) {
   var questionText = body.question_text || '';
 
   if (!code || !toLanguage) return res.status(400).json({ error: '"code" and "toLanguage" are required' });
-
-  var key = process.env.GROQ_API_KEY;
-  if (!key || key.indexOf('xxx') !== -1 || key.length < 20) {
-    return res.status(500).json({ error: 'No valid Groq API key configured on the server.' });
-  }
 
   // The portal's C++ judge doesn't support #include <bits/stdc++.h> — every
   // C++ translation must use standard headers instead (iostream, vector,
@@ -230,14 +344,11 @@ router.post('/translate-solution', function(req, res) {
     'Original (' + fromLanguage + '):\n' + code + '\n\n' +
     'Return ONLY the ' + toLanguage + ' code — no markdown fences, no explanation, no comments about the translation.';
 
-  translateCall([{ role: 'user', content: prompt }], key).then(function(result) {
+  callWithFallback('translate-solution', translateCall, [{ role: 'user', content: prompt }], 2000).then(function(result) {
     if (!result.ok) {
       return res.status(500).json({ error: 'Groq translation failed: ' + result.error });
     }
-    var code = result.content.trim()
-      .replace(/^```[a-zA-Z]*\n?/, '')
-      .replace(/```$/, '')
-      .trim();
+    var code = cleanCodeOutput(result.content);
     // CONFIRMED live: a translation between two very similar languages
     // (e.g. Java -> Java17) can come back empty after stripping fences —
     // the model apparently treats a near-identical target as needing no
@@ -249,7 +360,7 @@ router.post('/translate-solution', function(req, res) {
     if (!code) {
       return res.status(500).json({ error: 'Groq returned an empty translation — try Generate again.' });
     }
-    res.json({ ok: true, code: code, model: MODEL });
+    res.json({ ok: true, code: code, model: result.model || MODEL });
   });
 });
 
@@ -274,11 +385,6 @@ router.post('/translate-fragment', function(req, res) {
 
   if (!code || !toLanguage) return res.status(400).json({ error: '"code" and "toLanguage" are required' });
 
-  var key = process.env.GROQ_API_KEY;
-  if (!key || key.indexOf('xxx') !== -1 || key.length < 20) {
-    return res.status(500).json({ error: 'No valid Groq API key configured on the server.' });
-  }
-
   var cppConstraint = /^c\+\+/i.test(toLanguage)
     ? 'IMPORTANT: Do NOT use "#include <bits/stdc++.h>" — the portal\'s compiler does not support it. ' +
       'Use standard headers instead.\n'
@@ -295,21 +401,18 @@ router.post('/translate-fragment', function(req, res) {
     'Original ' + kind + ' (' + fromLanguage + '):\n' + code + '\n\n' +
     'Return ONLY the ' + toLanguage + ' ' + kind + ' code — no markdown fences, no explanation.';
 
-  translateCall([{ role: 'user', content: prompt }], key).then(function(result) {
+  callWithFallback('translate-fragment', translateCall, [{ role: 'user', content: prompt }], 2000).then(function(result) {
     if (!result.ok) {
       return res.status(500).json({ error: 'Groq fragment translation failed: ' + result.error });
     }
-    var out = result.content.trim()
-      .replace(/^```[a-zA-Z]*\n?/, '')
-      .replace(/```$/, '')
-      .trim();
+    var out = cleanCodeOutput(result.content);
     // Only called with a genuinely non-empty source header/footer, so an
     // empty result here is always a translation failure, not a legitimate
     // "nothing to translate" case — same reasoning as /translate-solution.
     if (!out) {
       return res.status(500).json({ error: 'Groq returned an empty ' + kind + ' translation — try Generate again.' });
     }
-    res.json({ ok: true, code: out, model: MODEL });
+    res.json({ ok: true, code: out, model: result.model || MODEL });
   });
 });
 
@@ -331,11 +434,6 @@ router.post('/translate-stub', function(req, res) {
   var questionText = body.question_text || '';
 
   if (!codeStub || !toLanguage) return res.status(400).json({ error: '"codeStub" and "toLanguage" are required' });
-
-  var key = process.env.GROQ_API_KEY;
-  if (!key || key.indexOf('xxx') !== -1 || key.length < 20) {
-    return res.status(500).json({ error: 'No valid Groq API key configured on the server.' });
-  }
 
   var cppConstraint = /^c\+\+/i.test(toLanguage)
     ? 'IMPORTANT: Do NOT use "#include <bits/stdc++.h>" — the portal\'s compiler does not support it. ' +
@@ -360,7 +458,7 @@ router.post('/translate-stub', function(req, res) {
     'TRANSLATED SOLUTION (' + toLanguage + ', correct — match this style/naming):\n' + (translatedSolution || '(not provided)') + '\n\n' +
     'Return ONLY the ' + toLanguage + ' CODE STUB code — no markdown fences, no explanation.';
 
-  translateCall([{ role: 'user', content: prompt }], key).then(function(result) {
+  callWithFallback('translate-stub', translateCall, [{ role: 'user', content: prompt }], 2000).then(function(result) {
     if (!result.ok) {
       return res.status(500).json({ error: 'Groq stub translation failed: ' + result.error });
     }
@@ -371,7 +469,7 @@ router.post('/translate-stub', function(req, res) {
     if (!out) {
       return res.status(500).json({ error: 'Groq returned an empty code-stub translation — try Generate again.' });
     }
-    res.json({ ok: true, code: out, model: MODEL });
+    res.json({ ok: true, code: out, model: result.model || MODEL });
   });
 });
 
@@ -382,6 +480,7 @@ router.post('/translate-stub', function(req, res) {
 // bug instead of re-guessing blind.
 function fixCall(messages, key, attempt) {
   attempt = attempt || 1;
+  return waitForTokenBudget(estimateTokens(messages, 2000)).then(function() {
   return axios.post(GROQ_BASE + '/chat/completions', {
     model: MODEL,
     messages: messages,
@@ -390,13 +489,18 @@ function fixCall(messages, key, attempt) {
   }, {
     headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
     timeout: 30000
+  });
   }).then(function(r) {
-    return { ok: true, content: r.data.choices[0].message.content };
+    return { ok: true, content: r.data.choices[0].message.content, model: MODEL };
   }).catch(function(err) {
     var status = err.response && err.response.status;
     if (status === 429 && attempt <= MAX_RETRIES) {
       var retryAfterHeader = Number(err.response.headers && err.response.headers['retry-after']);
       var delayMs = (retryAfterHeader > 0 ? retryAfterHeader * 1000 : Math.pow(2, attempt) * 1000);
+      if (delayMs > MAX_RETRY_DELAY_MS) {
+        console.log('[GROQ] fix-solution 429 — Retry-After ' + delayMs + 'ms exceeds the ' + MAX_RETRY_DELAY_MS + 'ms cap, failing fast (this is a real quota limit, not a brief burst)');
+        return { ok: false, error: 'Groq rate limit hit — it says to wait ' + Math.ceil(delayMs / 1000) + 's, which usually means your API key\'s quota is exhausted. Check console.groq.com for your usage/limits, or wait and try again later.' };
+      }
       console.log('[GROQ] fix-solution 429 — retrying in ' + delayMs + 'ms (attempt ' + attempt + '/' + MAX_RETRIES + ')');
       return wait(delayMs).then(function() { return fixCall(messages, key, attempt + 1); });
     }
@@ -425,11 +529,6 @@ router.post('/fix-solution', function(req, res) {
 
   if (!code || !language) return res.status(400).json({ error: '"code" and "language" are required' });
   if (!failures.length) return res.status(400).json({ error: '"failures" must be a non-empty array' });
-
-  var key = process.env.GROQ_API_KEY;
-  if (!key || key.indexOf('xxx') !== -1 || key.length < 20) {
-    return res.status(500).json({ error: 'No valid Groq API key configured on the server.' });
-  }
 
   var cppConstraint = /^c\+\+/i.test(language)
     ? 'IMPORTANT: Do NOT use "#include <bits/stdc++.h>" — the portal\'s compiler does not support it. Use standard headers instead.\n'
@@ -485,18 +584,15 @@ router.post('/fix-solution', function(req, res) {
     '— plain code only. Return ONLY the corrected ' + language + (snippetContext ? ' middle portion' : ' code') +
     ' — no markdown fences, no explanation' + (snippetContext ? ', and do NOT include the header or footer shown above' : '') + '.';
 
-  fixCall([{ role: 'user', content: prompt }], key).then(function(result) {
+  callWithFallback('fix-solution', fixCall, [{ role: 'user', content: prompt }], 2000).then(function(result) {
     if (!result.ok) {
       return res.status(500).json({ error: 'Groq fix failed: ' + result.error });
     }
-    var fixed = result.content.trim()
-      .replace(/^```[a-zA-Z]*\n?/, '')
-      .replace(/```$/, '')
-      .trim();
+    var fixed = cleanCodeOutput(result.content);
     if (!fixed) {
       return res.status(500).json({ error: 'Groq returned an empty fix — try Run tests again.' });
     }
-    res.json({ ok: true, code: fixed, model: MODEL });
+    res.json({ ok: true, code: fixed, model: result.model || MODEL });
   });
 });
 
