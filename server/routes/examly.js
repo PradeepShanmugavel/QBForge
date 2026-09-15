@@ -1036,187 +1036,121 @@ router.get('/tests/:name/questions', function(req, res) {
         return mapped;
       }
 
+      // PRIMARY PATH — CONFIRMED live against a real account, real 65-
+      // question test: GET /api/questions/test/:testId returns EVERY
+      // question in a test with its real qb_id attached directly (plus
+      // subject/topic/blooms_taxonomy/pcm_combination_ids), no name-
+      // guessing needed at all. This replaced an entire cascade of QB-
+      // NAME-based guessing (fast path / segment path / content-library
+      // path / full scan) that could only ever find a QB whose NAME shared
+      // vocabulary with the test's name — CONFIRMED it silently missed a
+      // real QB ("NeoColab_Assessment_Java_COD_File reader and writer")
+      // that shared literally zero words with its test's name
+      // ("VIT_Assessment_4_COD_File Handling_Checking"). This endpoint
+      // doesn't include createdBy/tags (CONFIRMED, checked exhaustively),
+      // so it's used only to learn each question's real qb_id — the
+      // existing trusted /api/v2/questionfilter scan (the SAME pipeline
+      // already used for pushing) then fetches the full pushable object,
+      // now against a small, EXACT set of QBs (usually 2-4) instead of
+      // hundreds of guessed candidates.
+      function fetchQbIdsForTest(testId) {
+        return eget('/api/questions/test/' + testId, token)
+          .then(function(r) {
+            var buckets = Array.isArray(r.data) ? r.data : [r.data];
+            var list = [];
+            buckets.forEach(function(b) {
+              list = list.concat((b && b.non_group_questions) || [], (b && b.group_questions) || []);
+            });
+            return list;
+          })
+          .catch(function(err) {
+            console.log('[EXAMLY] auto-QB: GET /api/questions/test/' + testId + ' failed -> ' +
+                        ((err.response && err.response.status) || err.message));
+            return [];
+          });
+      }
+
       console.log('[EXAMLY] auto-QB: pre-fetching ' + remaining.size + ' question(s) directly (for view/generate, and as a guaranteed fallback if no QB is ever found)...');
       return Promise.all(Array.from(remaining).map(directLookup))
         .then(function() {
-          // FAST PATH: a test and its QB very often share the same (or a
-          // similar) name — try that match next, usually just 1-2 requests,
-          // before ever falling back to scanning every QB one by one.
+          return Promise.all(tests.map(function(t) { return fetchQbIdsForTest(t.id); }));
+        })
+        .then(function(perTestLists) {
+          var qidToQbId = {};
+          perTestLists.forEach(function(list) {
+            list.forEach(function(q) {
+              var qid = q.q_id || q.question_id || q.id;
+              if (qid && q.qb_id && remaining.has(qid)) qidToQbId[qid] = q.qb_id;
+            });
+          });
+          var distinctQbIds = Array.from(new Set(Object.keys(qidToQbId).map(function(qid) { return qidToQbId[qid]; })));
+          console.log('[EXAMLY] auto-QB: direct test->QB lookup mapped ' + Object.keys(qidToQbId).length + '/' + remaining.size +
+                      ' question(s) to ' + distinctQbIds.length + ' distinct QB(s): ' + distinctQbIds.join(', '));
+
+          if (!distinctQbIds.length) return;
+
+          // Resolve id -> name for logging/display (CONFIRMED working
+          // endpoint from an earlier capture of the portal's own "Preview
+          // Test" action — same shape reused here). NOT built with
+          // baseBody() — CONFIRMED live this endpoint's schema is strict
+          // and 400s on an unexpected "branch_id" field (which baseBody()
+          // always adds); this one genuinely only takes these four.
+          var nameLookupBody = {
+            department_id: DEPARTMENT_IDS, mainDepartmentUser: true,
+            isTestPreview: true, qb_id_list: distinctQbIds
+          };
+          return epost('/api/questionbanks/all', nameLookupBody, token)
+            .then(function(nr) {
+              var qbNames = {};
+              ((nr.data && nr.data.questionbanks) || []).forEach(function(qb) { qbNames[qb.qb_id] = qb.qb_name; });
+              var qbList = distinctQbIds.map(function(id) { return { id: id, name: qbNames[id] || id }; });
+              return mapWithConcurrency(qbList, 3, scanQb);
+            })
+            .catch(function(err) {
+              console.log('[EXAMLY] auto-QB: QB name resolution failed (' + ((err.response && err.response.status) || err.message) +
+                          ') — scanning by id anyway, name will show as the raw id');
+              var qbList = distinctQbIds.map(function(id) { return { id: id, name: id }; });
+              return mapWithConcurrency(qbList, 3, scanQb);
+            });
+        })
+        .then(function() {
+          if (remaining.size === 0) { respond(); return; }
+
+          // FALLBACK — only reached if GET /api/questions/test/:id itself
+          // failed, or a scanned QB errored mid-request. Kept intentionally
+          // small (one name search, then the guaranteed direct-lookup
+          // fallback) since the primary path above now handles the
+          // overwhelming majority of cases the old multi-tier cascade
+          // existed to cover.
+          console.log('[EXAMLY] auto-QB: ' + remaining.size + ' id(s) still unresolved after direct QB lookup — trying a name search...');
           var fastSearchBody = baseBody({ page: 1, limit: 10, visibility: 'All', search: term });
           return epost('/api/v2/questionbanks', fastSearchBody, token)
             .then(function(fastR) {
               var candidates = normalise(fastR.data);
-              console.log('[EXAMLY] auto-QB: fast path — ' + candidates.length + ' QB(s) name-matched "' + term + '", checking those first...');
               return mapWithConcurrency(candidates, 3, scanQb);
             })
             .catch(function(err) {
-              console.log('[EXAMLY] auto-QB: fast path search failed (' + ((err.response && err.response.status) || err.message) + '), skipping to full scan');
+              console.log('[EXAMLY] auto-QB: name search failed (' + ((err.response && err.response.status) || err.message) + ')');
             })
             .then(function() {
               if (remaining.size === 0) { respond(); return; }
 
-              // SEGMENT PATH: the fast path above only tried the test's
-              // FULL literal name as a QB search term — but a cohort's QBs
-              // are very often named with just a SHARED PREFIX/segment of
-              // the test name (e.g. test "VIT_Assessment_4_COD_File
-              // Handling_Checking" drawing from QBs named "VIT_..."), not
-              // the full name verbatim.
-              //
-              // CONFIRMED live against the real API (direct curl, real
-              // case): Examly's QB search does LITERAL SUBSTRING matching
-              // on qb_name, not fuzzy/word matching — "VIT File Handling"
-              // (words joined with a space that never appears in any real
-              // QB name) returns 0 hits, while "File Handling" (the exact
-              // phrase, as it actually appears inside "VIT V_Java_FAT_COD_
-              // File Handling") returns 86. So splitting on EVERY space AND
-              // underscore was actively counter-productive — it broke
-              // "File Handling" into two independent single-word searches,
-              // each far too generic (25+ hits, real target buried past
-              // page 1) to ever pass along "VIT" (353 hits company-wide,
-              // hopeless to page through). Splitting on underscores ONLY
-              // keeps "File Handling" intact as one precise phrase, which
-              // is exactly what let this same case resolve in one request.
-              //
-              // NOTE: a prior "tag path" here searched by each question's
-              // own topic tags instead of the test name (e.g. "Inheritance",
-              // "file handling") — REMOVED after confirming live it was
-              // mostly noise: many tags are just reviewer names ("Ragul",
-              // "pradeep", "mithun", ...) that never match a QB, and its
-              // generic hits ("COD" -> 25 QBs, "file handling" -> 25 QBs)
-              // largely duplicated this segment path's own candidates
-              // without ever finding a real match — pure wasted requests
-              // against Examly's rate limit for a real case with 65
-              // questions all unresolved. QB-name-based search only, now.
-              var SEGMENT_STOPWORDS = { assessment: 1, checking: 1, final: 1, test: 1,
-                day: 1, batch: 1, cod: 1, code: 1, program: 1, session: 1, set: 1,
-                v1: 1, v2: 1, v3: 1, mcq: 1, coding: 1 };
-              var SEGMENT_FETCH_LIMIT = 100;
-              // Too-generic guard: a segment whose total match count exceeds
-              // what we actually fetch (e.g. "VIT" alone -> 353 hits) can't
-              // be meaningfully scanned from page 1 alone — skip it rather
-              // than burn requests scanning a near-random subset that's
-              // very unlikely to include the real target.
-              var SEGMENT_MAX_USABLE_COUNT = SEGMENT_FETCH_LIMIT;
-              var nameSegments = new Set();
-              term.split(/_+/).forEach(function(seg) {
-                var s = seg.trim();
-                if (s.length >= 3 && !/^\d+$/.test(s) && !SEGMENT_STOPWORDS[s.toLowerCase()]) nameSegments.add(s);
+              // GUARANTEED FALLBACK: no scan tier above found these
+              // question(s)' QB — rather than reporting "found nothing"
+              // (the old behavior), build them straight from the
+              // already-fetched direct-lookup cache above. View/generate
+              // works fully; Push is gated client-side on qbUnresolved
+              // until the real QB turns up (e.g. via a QB-name search).
+              console.log('[EXAMLY] auto-QB: ' + remaining.size + ' id(s) never matched any scanned QB — ' +
+                          'building them from direct lookup instead (view/generate only, push blocked until QB is found).');
+              Array.from(remaining).forEach(function(qid) {
+                var entity = directLookupCache[qid];
+                if (entity && (entity.answer || entity.learning)) {
+                  found.push(mapFromDirectLookup(qid, entity));
+                  remaining.delete(qid);
+                }
               });
-
-              if (!nameSegments.size) {
-                console.log('[EXAMLY] auto-QB: segment path — no usable segment in test name, skipping to content-library search');
-                return;
-              }
-              console.log('[EXAMLY] auto-QB: segment path — searching QBs by test-name segment(s): ' + Array.from(nameSegments).join(', '));
-              return mapWithConcurrency(Array.from(nameSegments), 3, function(seg) {
-                var segBody = baseBody({ page: 1, limit: SEGMENT_FETCH_LIMIT, visibility: 'All', search: seg });
-                return epost('/api/v2/questionbanks', segBody, token)
-                  .then(function(r) {
-                    var qbs = normalise(r.data);
-                    var total = (r.data.results && r.data.results.count) || qbs.length;
-                    if (total > SEGMENT_MAX_USABLE_COUNT) {
-                      console.log('[EXAMLY] auto-QB: segment "' + seg + '" -> ' + total + ' QB(s) total, too generic to page through — skipping');
-                      return [];
-                    }
-                    console.log('[EXAMLY] auto-QB: segment "' + seg + '" -> ' + qbs.length + ' of ' + total + ' QB(s)');
-                    return qbs;
-                  })
-                  .catch(function(err) {
-                    console.log('[EXAMLY] auto-QB: segment "' + seg + '" search failed -> ' + ((err.response && err.response.status) || err.message));
-                    return [];
-                  });
-              }).then(function(lists) {
-                var seen = {};
-                var candidates = [];
-                lists.forEach(function(qbs) {
-                  qbs.forEach(function(qb) {
-                    if (qb.id && !seen[qb.id]) { seen[qb.id] = true; candidates.push(qb); }
-                  });
-                });
-                console.log('[EXAMLY] auto-QB: segment path — ' + candidates.length + ' distinct QB(s) across all segment searches, scanning...');
-                return mapWithConcurrency(candidates, 3, scanQb);
-              });
-            })
-            .then(function() {
-              if (remaining.size === 0) { respond(); return; }
-
-              // CONTENT-LIBRARY PATH: CONFIRMED live — every single QB seen
-              // across this whole account (in every capture so far) is named
-              // "NeoColab_...", a shared practice-content library completely
-              // unrelated to cohort/test names like "PU_PG_...". With 19000+
-              // total QBs, a full unscoped scan is impractical, but this
-              // narrows the field to just the shared library before ever
-              // falling back to that. Cheap to try even if this account
-              // doesn't use that convention — worst case it just finds
-              // nothing and falls through unchanged.
-              console.log('[EXAMLY] auto-QB: content-library path — searching QBs named "NeoColab"...');
-              var libBody = baseBody({ page: 1, limit: 200, visibility: 'All', search: 'NeoColab' });
-              return epost('/api/v2/questionbanks', libBody, token)
-                .then(function(libR) {
-                  var libQbs = normalise(libR.data);
-                  var libTotal = (libR.data.results && libR.data.results.count) || libQbs.length;
-                  console.log('[EXAMLY] auto-QB: content-library path — ' + libQbs.length + ' of ' + libTotal + ' "NeoColab" QB(s) fetched, scanning...');
-                  return mapWithConcurrency(libQbs, 3, scanQb);
-                })
-                .catch(function(err) {
-                  console.log('[EXAMLY] auto-QB: content-library search failed (' + ((err.response && err.response.status) || err.message) + '), skipping to full scan');
-                })
-                .then(function() {
-                  if (remaining.size === 0) { respond(); return; }
-
-                  // SLOW PATH: nothing above covered everything — list every
-                  // QB the user can see and scan each one. Rate-limit-prone
-                  // (confirmed live: 200 QBs at concurrency 5 got almost all
-                  // 429'd), so kept at low concurrency and relies on
-                  // reqRetry's 429 backoff. Only reached if every targeted
-                  // path above came up empty.
-                  //
-                  // REVERTED a paginated (up to 1,000-QB) version of this —
-                  // CONFIRMED live it was actively harmful, not just slow:
-                  // a real run took 25+ minutes and still ended in a hard
-                  // failure. The bottleneck isn't page count, it's that a
-                  // meaningful fraction of individual QB scans hit Examly's
-                  // own rate limit and each retry (reqRetry, up to 5
-                  // attempts, capped at 15s/attempt) adds real wall-clock
-                  // time — multiplying that across hundreds more QBs turned
-                  // a bounded search into something that could never
-                  // realistically finish within one interactive request.
-                  // Back to a single page (200 QBs): slower to reach full
-                  // coverage on a 19,000+ QB account, but it actually
-                  // returns. Whatever's left goes to the guaranteed fallback
-                  // below exactly as before.
-                  console.log('[EXAMLY] auto-QB: still ' + remaining.size + ' id(s) unresolved, falling back to full QB scan...');
-                  var qbListBody = baseBody({ page: 1, limit: 200, visibility: 'All' });
-                  return epost('/api/v2/questionbanks', qbListBody, token).then(function(qbr) {
-                    var qbs = normalise(qbr.data);
-                    var totalReported = (qbr.data.results && qbr.data.results.count) || qbs.length;
-                    if (totalReported > qbs.length) {
-                      console.log('[EXAMLY] auto-QB: WARNING only fetched ' + qbs.length + ' of ' + totalReported +
-                                  ' QB(s) (single-page limit) — some questions may not be found. Raise the page limit if this keeps happening.');
-                    }
-                    return mapWithConcurrency(qbs, 2, scanQb);
-                  });
-                })
-                .then(function() {
-                  if (remaining.size === 0) { respond(); return; }
-
-                  // GUARANTEED FALLBACK: no scan tier above found these
-                  // question(s)' QB — rather than reporting "found nothing"
-                  // (the old behavior), build them straight from the
-                  // already-fetched direct-lookup cache above. View/generate
-                  // works fully; Push is gated client-side on qbUnresolved
-                  // until the real QB turns up (e.g. via a QB-name search).
-                  console.log('[EXAMLY] auto-QB: ' + remaining.size + ' id(s) never matched any scanned QB — ' +
-                              'building them from direct lookup instead (view/generate only, push blocked until QB is found).');
-                  Array.from(remaining).forEach(function(qid) {
-                    var entity = directLookupCache[qid];
-                    if (entity && (entity.answer || entity.learning)) {
-                      found.push(mapFromDirectLookup(qid, entity));
-                      remaining.delete(qid);
-                    }
-                  });
-                  respond();
-                });
+              respond();
             });
         });
     })
